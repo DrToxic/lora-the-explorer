@@ -26,7 +26,7 @@ class MockRadioAdapter(RadioAdapter):
     def get_contacts(self) -> dict:
         return dict(self.contacts)
 
-    async def connect(self) -> None:
+    async def connect(self, retry_on_failure: bool = False) -> None:
         self.connected = True
 
     async def disconnect(self) -> None:

@@ -24,8 +24,10 @@ SRC = REPO_ROOT / "src"
 # compiled extensions, authlib/joserfc pick crypto backends dynamically.
 # collect_all is the defensive "make it work" answer for exactly this —
 # costs bundle size, not correctness. pystray needs the same treatment for
-# its per-platform backend selection.
-COLLECT_ALL = ["uvicorn", "bleak", "meshcore", "h3", "authlib", "joserfc", "pystray"]
+# its per-platform backend selection, and pyserial's list_ports imports its
+# per-OS backend (list_ports_windows) by name at call time.
+COLLECT_ALL = ["uvicorn", "bleak", "meshcore", "h3", "authlib", "joserfc", "pystray",
+               "serial"]
 
 datas = [
     (str(SRC / "lora_explorer" / "web" / "templates"), "lora_explorer/web/templates"),

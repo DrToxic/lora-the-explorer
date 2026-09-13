@@ -218,10 +218,15 @@
 
             <!-- USB fields -->
             <div id="fields-usb">
+                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                    <button type="button" class="outline" id="serial-scan-btn" onclick="scanSerial()" style="margin: 0;">Scan for Ports</button>
+                    <span id="serial-scan-status" style="font-size: 0.85rem; opacity: 0.6;"></span>
+                </div>
+                <div class="ble-devices" id="serial-ports"></div>
                 <label for="usb-port">Serial Port
                     <input type="text" id="usb-port" value="/dev/ttyUSB0" autocomplete="off">
                 </label>
-                <small style="opacity: 0.6;">Common ports: <code>/dev/ttyUSB0</code>, <code>/dev/ttyACM0</code>, <code>/dev/cu.usbmodem*</code></small>
+                <small style="opacity: 0.6;">Windows: <code>COM3</code>, <code>COM11</code>. Linux: <code>/dev/ttyUSB0</code>, <code>/dev/ttyACM0</code>. macOS: <code>/dev/cu.usbmodem*</code></small>
             </div>
 
             <!-- BLE fields -->
@@ -419,6 +424,58 @@
         });
     };
 
+    window.scanSerial = function() {
+        const btn = document.getElementById('serial-scan-btn');
+        const status = document.getElementById('serial-scan-status');
+        const list = document.getElementById('serial-ports');
+        btn.disabled = true;
+        status.textContent = 'Scanning...';
+        list.innerHTML = '';
+
+        fetch('/api/companion/scan-serial')
+        .then(r => r.json())
+        .then(data => {
+            btn.disabled = false;
+            if (data.error) {
+                status.textContent = data.error;
+                return;
+            }
+            const ports = data.ports || [];
+            if (ports.length === 0) {
+                status.textContent = 'No serial ports found';
+                return;
+            }
+            status.textContent = ports.length + ' port(s) found';
+            ports.forEach(p => {
+                // textContent, not innerHTML - the description is driver-supplied.
+                const el = document.createElement('div');
+                el.className = 'ble-device';
+                const wrap = document.createElement('span');
+                const name = document.createElement('strong');
+                name.textContent = p.device;
+                wrap.appendChild(name);
+                if (p.description) {
+                    wrap.appendChild(document.createElement('br'));
+                    const desc = document.createElement('small');
+                    desc.style.opacity = '0.6';
+                    desc.textContent = p.description;
+                    wrap.appendChild(desc);
+                }
+                el.appendChild(wrap);
+                el.onclick = function() {
+                    document.querySelectorAll('#serial-ports .ble-device').forEach(x => x.classList.remove('selected'));
+                    el.classList.add('selected');
+                    document.getElementById('usb-port').value = p.device;
+                };
+                list.appendChild(el);
+            });
+        })
+        .catch(() => {
+            btn.disabled = false;
+            status.textContent = 'Scan failed';
+        });
+    };
+
     window.scanBle = function() {
         const btn = document.getElementById('ble-scan-btn');
         const status = document.getElementById('ble-scan-status');
@@ -442,7 +499,7 @@
                 el.className = 'ble-device';
                 el.innerHTML = '<span><strong>' + (d.name || 'Unknown') + '</strong><br><small style="opacity:0.6;">' + d.address + '</small></span>';
                 el.onclick = function() {
-                    document.querySelectorAll('.ble-device').forEach(x => x.classList.remove('selected'));
+                    document.querySelectorAll('#ble-devices .ble-device').forEach(x => x.classList.remove('selected'));
                     el.classList.add('selected');
                     document.getElementById('ble-address').value = d.address;
                 };

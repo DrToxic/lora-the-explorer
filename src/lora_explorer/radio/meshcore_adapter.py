@@ -5,7 +5,10 @@ import os
 import time
 from urllib.parse import quote_plus
 from meshcore import MeshCore, EventType
-from .adapter import RadioAdapter, IncomingMessage, MessageHandler, PositionResult, PositionFailure
+from .adapter import (
+    RadioAdapter, IncomingMessage, MessageHandler, ConnectHandler,
+    PositionResult, PositionFailure,
+)
 from .airtime import AirtimeGovernor, SAMPLE_MAX_AGE_S
 
 log = logging.getLogger(__name__)
@@ -288,6 +291,10 @@ class MeshCoreAdapter(RadioAdapter):
         self._last_contact_refresh: float = 0
         self._reconnect_task: asyncio.Task | None = None
         self._shutting_down = False
+        # Why the companion isn't connected, in the player's words — shown on
+        # the Settings page so a failed/lost connection isn't silent.
+        self._last_error: str = ""
+        self._connect_handler: ConnectHandler | None = None
         self._travel_mode: str = "walking"
         self._route_state: dict[str, int] = {}
         # Up to the two most recent successful (lat, lon, ts) fixes per node
@@ -562,16 +569,78 @@ class MeshCoreAdapter(RadioAdapter):
             del hist[:-2]
         self._save_route_state()
 
-    async def connect(self) -> None:
+    async def connect(self, retry_on_failure: bool = False) -> None:
+        """Open a companion session.
+
+        ``retry_on_failure=True`` makes a failed connect non-fatal: the error is
+        recorded (and surfaced by ``get_companion_status``), a background retry
+        loop is started, and the caller continues. Startup uses this — a
+        companion that's unplugged, renumbered (COM6 -> COM11) or rebooting must
+        never stop the web dashboard from binding, because the dashboard is the
+        only place the player can fix the setting. Callers that want to report
+        the failure themselves (the Settings save/test routes) leave it False
+        and handle the exception."""
         if not self._configured:
             log.info("Companion not configured — skipping connection")
             return
         self._shutting_down = False
-        self._mc = await self._create_connection()
-        log.info("Connected to companion via %s", self._connection_desc())
+        try:
+            await self._open_session()
+        except Exception as e:
+            self._last_error = str(e) or e.__class__.__name__
+            if not retry_on_failure:
+                raise
+            log.warning(
+                "Could not connect to companion via %s: %s — retrying in the "
+                "background; fix the connection in Settings if it's wrong",
+                self._connection_desc(), e,
+            )
+            self.begin_retry()
 
-        await self._initialize_session()
+    async def _open_session(self) -> None:
+        """Connect + initialize, shared by the first connect and every retry so
+        the two paths can't drift. Cleans up after itself on failure — a link
+        that opened but failed to initialize would otherwise be left half-open
+        and read as "connected"."""
+        try:
+            self._mc = await self._create_connection()
+            log.info("Connected to companion via %s", self._connection_desc())
+            await self._initialize_session()
+        except Exception:
+            await self._discard_connection()
+            raise
+        self._last_error = ""
         log.info("Listening for messages")
+        # Post-connect work (repeater cache, name reconcile) lives in the engine
+        # and must run on *every* successful connect, not just the first — with
+        # startup retries, the first success is often inside the retry loop.
+        await self._fire_connect_handler()
+
+    async def _discard_connection(self) -> None:
+        """Tear down whatever of a session exists, ignoring errors. Used after a
+        failed connect (which can leave a half-open link) and before a retry."""
+        mc, self._mc = self._mc, None
+        if not mc:
+            return
+        try:
+            await mc.stop_auto_message_fetching()
+        except Exception:
+            pass
+        try:
+            await mc.disconnect()
+        except Exception:
+            pass
+
+    def begin_retry(self) -> None:
+        """Start the background reconnect loop if one isn't already running.
+        Public so the Settings save route can keep trying after reporting a
+        failed save (e.g. the player saved the right port before plugging the
+        node back in)."""
+        if self._shutting_down or not self._configured:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def reconfigure(
         self,
@@ -581,9 +650,15 @@ class MeshCoreAdapter(RadioAdapter):
         serial_port: str = "/dev/ttyUSB0",
         ble_address: str = "",
         ble_pin: str = "",
+        retry_on_failure: bool = False,
     ) -> None:
-        if self._mc:
-            await self.disconnect()
+        # Unconditional, not `if self._mc` — a *failed* connection still leaves a
+        # retry loop running, and that loop reads these fields. Leaving it alive
+        # across a reconfigure would race the connect below (both calling
+        # _create_connection, one of the two sessions ending up untracked) and
+        # would inherit the old backoff. disconnect() cancels it; the fresh loop
+        # this starts, if any, begins at the base delay again.
+        await self.disconnect()
 
         self._connection_type = connection_type
         self._host = host
@@ -598,8 +673,9 @@ class MeshCoreAdapter(RadioAdapter):
         )
         self._shutting_down = False
         self._contacts = {}
+        self._last_error = ""
 
-        await self.connect()
+        await self.connect(retry_on_failure=retry_on_failure)
 
     async def disconnect(self) -> None:
         self._shutting_down = True
@@ -610,15 +686,7 @@ class MeshCoreAdapter(RadioAdapter):
             except asyncio.CancelledError:
                 pass
         if self._mc:
-            try:
-                await self._mc.stop_auto_message_fetching()
-            except Exception:
-                pass
-            try:
-                await self._mc.disconnect()
-            except Exception:
-                pass
-            self._mc = None
+            await self._discard_connection()
             log.info("Disconnected")
 
     @staticmethod
@@ -710,6 +778,19 @@ class MeshCoreAdapter(RadioAdapter):
 
     async def set_message_handler(self, handler: MessageHandler) -> None:
         self._handler = handler
+
+    def set_connect_handler(self, handler: ConnectHandler) -> None:
+        self._connect_handler = handler
+
+    async def _fire_connect_handler(self) -> None:
+        if not self._connect_handler:
+            return
+        try:
+            await self._connect_handler()
+        except Exception:
+            # Post-connect work is best-effort — it must never fail the
+            # connection itself or break the retry loop that's driving it.
+            log.exception("Post-connect handler failed")
 
     async def request_position(
         self, node_key: str, progress_callback=None,
@@ -911,10 +992,8 @@ class MeshCoreAdapter(RadioAdapter):
             return
         reason = event.payload.get("reason", "unknown") if event.payload else "unknown"
         log.warning("Connection lost: %s", reason)
-
-        if self._reconnect_task and not self._reconnect_task.done():
-            return
-        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        self._last_error = f"Connection lost: {reason}"
+        self.begin_retry()
 
     async def _reconnect_loop(self) -> None:
         delay = RECONNECT_BASE_DELAY
@@ -928,22 +1007,12 @@ class MeshCoreAdapter(RadioAdapter):
                 return
 
             try:
-                if self._mc:
-                    try:
-                        await self._mc.stop_auto_message_fetching()
-                    except Exception:
-                        pass
-                    try:
-                        await self._mc.disconnect()
-                    except Exception:
-                        pass
-
-                self._mc = await self._create_connection()
-                await self._initialize_session()
-
+                await self._discard_connection()
+                await self._open_session()
                 log.info("Reconnected successfully after %d attempts", attempt)
                 return
             except Exception as e:
+                self._last_error = str(e) or e.__class__.__name__
                 log.warning("Reconnect attempt %d failed: %s", attempt, e)
                 delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
@@ -1092,7 +1161,13 @@ class MeshCoreAdapter(RadioAdapter):
         async fetch that hydrates the panel)."""
         mc = self._mc
         if not mc:
-            return {"connected": False, "configured": self._configured}
+            return {
+                "connected": False,
+                "configured": self._configured,
+                "connection": self._connection_desc() if self._configured else "",
+                "last_error": self._last_error,
+                "retrying": bool(self._reconnect_task and not self._reconnect_task.done()),
+            }
         status: dict = {"connected": True, "connection": self._connection_desc()}
         si = mc.self_info
         if si:

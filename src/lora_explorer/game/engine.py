@@ -741,12 +741,20 @@ class GameEngine:
         # monotonic and unique across restarts.
         self._event_seq = await self._db.get_max_event_id()
         await self._adapter.set_message_handler(self._handle_message)
-        await self._adapter.connect()
+        self._adapter.set_connect_handler(self._on_radio_connected)
+        # Non-fatal by design: a missing/renumbered/unplugged companion must not
+        # stop the rest of the app (above all the web dashboard, the only place
+        # the connection setting can be fixed) from starting. The adapter keeps
+        # retrying in the background and calls back when it gets in.
+        await self._adapter.connect(retry_on_failure=True)
         log.info(
             "Game engine started. Base camp at %.4f, %.4f",
             self._home_lat,
             self._home_lon,
         )
+
+    async def _on_radio_connected(self) -> None:
+        """Post-connect work, run on the first connect and every reconnect."""
         try:
             await self.refresh_repeaters()
         except Exception:

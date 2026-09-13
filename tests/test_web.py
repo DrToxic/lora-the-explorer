@@ -26,7 +26,7 @@ class MockRadioAdapter(RadioAdapter):
         self.mock_position = FAR_POSITION
         self.engine = None
 
-    async def connect(self):
+    async def connect(self, retry_on_failure: bool = False):
         self.connected = True
 
     async def disconnect(self):
@@ -1939,4 +1939,72 @@ async def test_add_spyglass_route_rejects_invalid_json_body(app):
     status, body, _ = await _asgi_request(
         app, "POST", "/api/companion/add-spyglass", data=None)
     assert status == 400
+    assert json.loads(body)["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_scan_serial_lists_ports(app, monkeypatch):
+    """The USB picker exists because a replaced node can come back on a
+    different COM number, which the player has no way to guess."""
+    import types as _types
+    from serial.tools import list_ports
+
+    monkeypatch.setattr(list_ports, "comports", lambda: [
+        _types.SimpleNamespace(device="COM11", description="USB Serial Device"),
+        _types.SimpleNamespace(device="COM3", description="n/a"),
+    ])
+    status, body, _ = await _asgi_request(app, "GET", "/api/companion/scan-serial")
+    assert status == 200
+    ports = json.loads(body)["ports"]
+    # Natural order: COM3 before COM11, not lexicographic.
+    assert [p["device"] for p in ports] == ["COM3", "COM11"]
+    # pyserial's "n/a" placeholder is noise, not a description.
+    assert ports[0]["description"] == ""
+    assert ports[1]["description"] == "USB Serial Device"
+
+
+@pytest.mark.asyncio
+async def test_scan_serial_reports_failure_without_500(app, monkeypatch):
+    from serial.tools import list_ports
+
+    def boom():
+        raise OSError("enumeration exploded")
+
+    monkeypatch.setattr(list_ports, "comports", boom)
+    status, body, _ = await _asgi_request(app, "GET", "/api/companion/scan-serial")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ports"] == []
+    assert payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_settings_page_explains_why_the_companion_is_disconnected(app, adapter):
+    """A bare "Disconnected" sent a player database-diving to find a stale COM
+    port; the radio's own error is what actually tells them the fix."""
+    async def disconnected_status(include_stats=True):
+        return {
+            "connected": False,
+            "configured": True,
+            "connection": "serial COM6",
+            "last_error": "could not open port 'COM6'",
+            "retrying": True,
+        }
+
+    adapter.get_companion_status = disconnected_status
+    status, body, _ = await _asgi_request(app, "GET", "/settings")
+    assert status == 200
+    assert "could not open port &#39;COM6&#39;" in body or "could not open port 'COM6'" in body
+    assert "Still retrying" in body
+
+
+@pytest.mark.asyncio
+async def test_save_companion_config_without_a_radio_still_reports_cleanly(app):
+    """radio is an optional app-state slot; the save path must not blow up on
+    it (the failure branch dereferences it to start a background retry)."""
+    app.state.radio = None
+    status, body, _ = await _asgi_request(
+        app, "POST", "/api/companion/config",
+        json_body={"connection_type": "usb", "serial_port": "COM11"})
+    assert status == 200
     assert json.loads(body)["ok"] is False

@@ -128,14 +128,36 @@ class TrayApp:
         self._icon.run_detached()
         try:
             asyncio.run(lora_main.run(on_ready=self._on_ready))
-        except Exception:
+        except Exception as e:
             # Belt-and-suspenders: the stdout/stderr guard above should mean
             # exceptions no longer vanish, but a windowed build has no console
             # to show them either way — the log file is the only place a user
             # (or Open Log Folder from the tray menu) can ever see this.
             log.exception("Fatal error during startup/run")
+            self._notify_fatal(e)
         finally:
             self._icon.stop()
+
+    def _notify_fatal(self, error: Exception) -> None:
+        """Tell the user something. Without this the only symptom of a fatal
+        startup error is the tray icon quietly disappearing while the browser
+        shows a dead page — which is indistinguishable from "it didn't launch"."""
+        message = (
+            f"LoRa the Explorer could not start:\n\n{type(error).__name__}: {error}\n\n"
+            f"Details are in:\n{_LOG_PATH}"
+        )
+        try:
+            import ctypes
+            # MB_OK | MB_ICONERROR | MB_SETFOREGROUND
+            ctypes.windll.user32.MessageBoxW(None, message, "LoRa the Explorer", 0x10 | 0x10000)
+            return
+        except Exception:
+            log.debug("Could not show the error dialog", exc_info=True)
+        try:
+            if self._icon:
+                self._icon.notify(message, "LoRa the Explorer")
+        except Exception:
+            log.debug("Could not show the tray notification", exc_info=True)
 
 
 def main() -> None:

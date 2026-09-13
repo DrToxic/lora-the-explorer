@@ -148,7 +148,21 @@
             <small>Status</small><br>
             <span style="color: var(--pico-del-color);">● Disconnected</span>
         </div>
+        {% if companion and companion.configured and companion.connection %}
+        <div>
+            <small>Configured as</small><br>
+            {{ config.connection_type | upper }} · {{ companion.connection }}
+        </div>
+        {% endif %}
     </div>
+    {# Say WHY. A silent "Disconnected" sent one player database-diving to find #}
+    {# a stale COM port; the reason the radio gave is the whole fix.            #}
+    {% if companion and companion.last_error %}
+    <p class="doc-hint" style="margin-top: -0.5rem; margin-bottom: 1rem;">
+        Last attempt: <code style="word-break: break-word;">{{ companion.last_error }}</code>
+        {% if companion.retrying %}<br>Still retrying in the background — or fix the connection below.{% endif %}
+    </p>
+    {% endif %}
     {% endif %}
 
     {# Connection setup lives inline now: the whole section is collapsible, so a #}
@@ -171,10 +185,15 @@
             </div>
 
             <div class="conn-panel {% if config.connection_type == 'usb' %}active{% endif %}" id="panel-usb">
+                <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                    <button type="button" class="game-btn game-btn-secondary" id="s-serial-scan-btn" onclick="settingsScanSerial()">Scan for Ports</button>
+                    <span id="s-serial-scan-status" style="font-size: 0.85rem; opacity: 0.6;"></span>
+                </div>
+                <div class="ble-devices" id="s-serial-ports"></div>
                 <label for="s-usb-port">Serial Port
                     <input type="text" id="s-usb-port" value="{{ config.serial_port or '/dev/ttyUSB0' }}" autocomplete="off">
                 </label>
-                <small style="opacity: 0.6;">Common: <code>/dev/ttyUSB0</code>, <code>/dev/ttyACM0</code>, <code>/dev/cu.usbmodem*</code></small>
+                <small style="opacity: 0.6;">Windows: <code>COM3</code>, <code>COM11</code>. Linux: <code>/dev/ttyUSB0</code>, <code>/dev/ttyACM0</code>. macOS: <code>/dev/cu.usbmodem*</code>. A port number can change when you replace or re-plug the node — scan and pick it again.</small>
             </div>
 
             <div class="conn-panel {% if config.connection_type == 'ble' %}active{% endif %}" id="panel-ble">
@@ -1057,6 +1076,49 @@
                     document.querySelectorAll('#s-ble-devices .ble-device').forEach(x => x.classList.remove('selected'));
                     el.classList.add('selected');
                     document.getElementById('s-ble-address').value = d.address;
+                };
+                list.appendChild(el);
+            });
+        })
+        .catch(() => { btn.disabled = false; status.textContent = 'Scan failed'; });
+    };
+
+    window.settingsScanSerial = function() {
+        const btn = document.getElementById('s-serial-scan-btn');
+        const status = document.getElementById('s-serial-scan-status');
+        const list = document.getElementById('s-serial-ports');
+        btn.disabled = true;
+        status.textContent = 'Scanning...';
+        list.innerHTML = '';
+
+        fetch('/api/companion/scan-serial')
+        .then(r => r.json())
+        .then(data => {
+            btn.disabled = false;
+            if (data.error) { status.textContent = data.error; return; }
+            const ports = data.ports || [];
+            if (ports.length === 0) { status.textContent = 'No serial ports found'; return; }
+            status.textContent = ports.length + ' port(s) found';
+            ports.forEach(p => {
+                // textContent, not innerHTML — the description comes from the
+                // device/driver, so it's untrusted string data.
+                const el = document.createElement('div');
+                el.className = 'ble-device';
+                const wrap = document.createElement('span');
+                const name = document.createElement('strong');
+                name.textContent = p.device;
+                wrap.appendChild(name);
+                if (p.description) {
+                    const desc = document.createElement('small');
+                    desc.style.opacity = '0.6';
+                    desc.textContent = ' ' + p.description;
+                    wrap.appendChild(desc);
+                }
+                el.appendChild(wrap);
+                el.onclick = function() {
+                    document.querySelectorAll('#s-serial-ports .ble-device').forEach(x => x.classList.remove('selected'));
+                    el.classList.add('selected');
+                    document.getElementById('s-usb-port').value = p.device;
                 };
                 list.appendChild(el);
             });

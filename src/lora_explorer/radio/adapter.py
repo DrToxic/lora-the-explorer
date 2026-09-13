@@ -33,6 +33,9 @@ class IncomingMessage:
 
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[str | None]]
+# Called after every successful companion connect (first one and every
+# reconnect), so the engine can redo its post-connect work.
+ConnectHandler = Callable[[], Awaitable[None]]
 
 
 class RadioAdapter(ABC):
@@ -40,7 +43,9 @@ class RadioAdapter(ABC):
     _mc = None
 
     @abstractmethod
-    async def connect(self) -> None:
+    async def connect(self, retry_on_failure: bool = False) -> None:
+        """``retry_on_failure=True`` asks the adapter to swallow a failed
+        connect and keep retrying in the background instead of raising."""
         ...
 
     @abstractmethod
@@ -54,6 +59,15 @@ class RadioAdapter(ABC):
     @abstractmethod
     async def set_message_handler(self, handler: MessageHandler) -> None:
         ...
+
+    def set_connect_handler(self, handler: ConnectHandler) -> None:
+        """Adapters with no connection lifecycle of their own ignore this."""
+        pass
+
+    def begin_retry(self) -> None:
+        """Start reconnecting in the background. No-op for adapters that don't
+        maintain a connection."""
+        pass
 
     @abstractmethod
     async def request_position(

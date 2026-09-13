@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import platform
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -1900,6 +1901,9 @@ async def save_companion_config(request: Request):
     await db.save_companion_config(cfg)
 
     radio = request.app.state.radio
+    if not radio:
+        request.app.state.config.update(cfg)
+        return JSONResponse({"ok": False, "error": "Saved, but no radio adapter is available"})
     try:
         await radio.reconfigure(
             connection_type=connection_type,
@@ -1913,6 +1917,10 @@ async def save_companion_config(request: Request):
         return JSONResponse({"ok": True, "message": "Connected successfully"})
     except Exception as e:
         request.app.state.config.update(cfg)
+        # The config is saved either way, so keep trying in the background — a
+        # node that's still booting (or wasn't plugged in yet) then comes up on
+        # its own without the player having to hit Save again.
+        radio.begin_retry()
         return JSONResponse({"ok": False, "error": f"Saved but connection failed: {e}"}, status_code=200)
 
 
@@ -1931,10 +1939,45 @@ async def test_companion_connection(request: Request):
     try:
         await test_adapter.connect()
         status = await test_adapter.get_companion_status()
-        await test_adapter.disconnect()
         return JSONResponse({"ok": True, "status": status})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
+    finally:
+        # Always tear the throwaway adapter down — on the failure path too, so a
+        # test against a dead port can't leave a session or task behind.
+        await test_adapter.disconnect()
+
+
+@router.get("/api/companion/scan-serial")
+async def scan_serial(request: Request):
+    """Serial ports this machine can see, for the USB connection picker.
+
+    Windows renumbers COM ports when a node is replaced or moved to another USB
+    socket, and there's no way to guess the new number from inside the app — so
+    the player needs to be able to look. Purely local enumeration: no device is
+    opened and nothing is sent."""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return JSONResponse({"ports": [], "error": "Serial support is not installed"})
+    try:
+        ports = [
+            {
+                "device": p.device,
+                # pyserial reports "n/a" when the driver gives no description.
+                "description": "" if p.description in (None, "n/a") else p.description,
+            }
+            for p in list_ports.comports()
+        ]
+    except Exception as e:
+        log.warning("Serial port scan failed: %s", e)
+        return JSONResponse({"ports": [], "error": "Could not list serial ports"})
+    # Natural sort, so COM3 lands before COM11 (and ttyUSB2 before ttyUSB10).
+    ports.sort(key=lambda p: [
+        int(tok) if tok.isdigit() else tok.lower()
+        for tok in re.split(r"(\d+)", p["device"])
+    ])
+    return JSONResponse({"ports": ports})
 
 
 @router.get("/api/companion/scan-ble")

@@ -70,7 +70,12 @@ async def _load_companion_config(db: Database, env_config: dict) -> dict:
             "ble_address": saved.get("ble_address", ""),
             "ble_pin": saved.get("ble_pin", ""),
         }
-    if env_config["companion_host"] or env_config["ble_address"]:
+    # A USB deployment sets CONNECTION_TYPE=usb + SERIAL_PORT and has neither a
+    # host nor a BLE address, so it has to be recognized explicitly — testing
+    # only the other two silently dropped the whole env config on the floor and
+    # started up unconfigured.
+    usb_from_env = env_config["connection_type"] == "usb" and env_config["serial_port"]
+    if env_config["companion_host"] or env_config["ble_address"] or usb_from_env:
         return {
             "connection_type": env_config["connection_type"],
             "companion_host": env_config["companion_host"],
